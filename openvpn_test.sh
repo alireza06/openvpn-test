@@ -50,17 +50,27 @@ cleanup() {
     pkill -f "openvpn --config" &>/dev/null
     # Delete the network namespace.
     ip netns del $NAMESPACE &>/dev/null
+    ip link del veth-wsl
+    iptables -t nat -F
+    sysctl -w net.ipv4.ip_forward=0
     # Remove temporary files.
-    # rm -f "$CRED_FILE" "$LOG_FILE"
+    rm -f "$CRED_FILE" "$LOG_FILE"
     echo "Cleanup complete."
 }
 
 # Set a trap to call the cleanup function on script exit or interrupt.
-trap cleanup EXIT SIGINT SIGTERM
+trap cleanup EXIT
+
+sysctl -w net.ipv4.ip_forward=1
+ip link add veth-ns type veth peer name veth-wsl
+ip link set veth-wsl up
+ip addr add 192.168.200.1/24 dev veth-wsl
+iptables -t nat -F
+iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o eth0 -j MASQUERADE
 
 # Loop through all files ending with.ovpn in the specified directory.
-for config_file in "$CONFIG_DIR"/*/*.ovpn; do
-    echo "Testing configuration: $config_file"
+find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file; do
+    echo "Selecting configuration in $config_file"
     # Skip iteration if no .ovpn files are present to prevent errors.
     [ -e "$config_file" ] || continue
 
@@ -75,8 +85,7 @@ for config_file in "$CONFIG_DIR"/*/*.ovpn; do
         if [ ! -e  "$CRED_FILE" ]; then
             echo "Credentials not found or invalid. Please provide them."
             read -p "Enter Username: " username
-            # Use -s for silent (password) input and -p for a prompt. [1, 2]
-            read -sp "Enter Password: " password
+            read -s -p "Enter Password: " password
             echo # Add a newline after the hidden password prompt.
             
             # Store credentials in the file, username on line 1, password on line 2. [6]
@@ -100,23 +109,25 @@ for config_file in "$CONFIG_DIR"/*/*.ovpn; do
 
         # Bring up the loopback interface inside the namespace (good practice).
         ip netns exec $NAMESPACE ip link set lo up
+        ip link set veth-ns netns $NAMESPACE
+        ip netns exec $NAMESPACE ip link set veth-ns up
+        ip netns exec $NAMESPACE ip addr add 192.168.200.2/24 dev veth-ns
+        ip netns exec $NAMESPACE ip route add default via 192.168.200.1
 
         # --- Connection Attempt ---
         # Start OpenVPN in the background, using the credentials file and logging the output.
-        ip netns exec $NAMESPACE openvpn --config "$config_file" --auth-user-pass "$CRED_FILE" --log "$LOG_FILE" --daemon
-
+        ip netns exec $NAMESPACE openvpn --config "$config_file" --log "$LOG_FILE" &
         echo "Waiting for VPN connection (timeout: $TIMEOUT seconds)..."
         
         connected=false
         # Poll for a 'tun0' interface to appear and be 'UP' inside the namespace.
-        for ((i=1; i<=$TIMEOUT; i++)); do
-            if ip netns exec $NAMESPACE ip link show tun0 &>/dev/null && \
-                ip netns exec $NAMESPACE ip link show tun0 | grep -q "state UP"; then
+        for ((i=1; i<=${TIMEOUT}*2; i++)); do
+            if ip netns exec $NAMESPACE ip link show tun0 &>/dev/null; then
                 echo "VPN interface 'tun0' is UP."
                 connected=true
                 break
             fi
-            sleep 1
+            sleep 0.5
             echo -n "."
         done
         echo # Newline after the dots.
@@ -134,8 +145,9 @@ for config_file in "$CONFIG_DIR"/*/*.ovpn; do
             fi
         else
             # If connection timed out, check the log for an authentication failure. [3]
-            if grep -q "AUTH_FAILED" "$LOG_FILE"; then
-                echo "FAILURE: Authentication failed with the provided credentials."
+            if grep -q "ERROR" "$LOG_FILE"; then
+                echo "Error occured during connection:"
+                grep -q "ERROR" "$LOG_FILE"
                 rm -f "$CRED_FILE" # Remove bad credentials.
                 # The 'while' loop will now repeat for the same config, prompting for new credentials.
             else
