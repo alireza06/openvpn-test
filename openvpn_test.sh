@@ -50,26 +50,25 @@ cleanup() {
     pkill -f "openvpn --config" &>/dev/null
     # Delete the network namespace.
     ip netns del $NAMESPACE &>/dev/null
-    ip link del veth-wsl
+    ip link del veth-wsl &>/dev/null
     iptables -t nat -F
-    sysctl -w net.ipv4.ip_forward=0
+    sysctl -q -w net.ipv4.ip_forward=0
     # Remove temporary files.
-    rm -f "$CRED_FILE" "$LOG_FILE"
+    rm -f "$CRED_FILE"
+    rm -f "$LOG_FILE"
     echo "Cleanup complete."
 }
 
 # Set a trap to call the cleanup function on script exit or interrupt.
 trap cleanup EXIT
 
-sysctl -w net.ipv4.ip_forward=1
-ip link add veth-ns type veth peer name veth-wsl
-ip link set veth-wsl up
-ip addr add 192.168.200.1/24 dev veth-wsl
+sysctl -q -w net.ipv4.ip_forward=1
 iptables -t nat -F
 iptables -t nat -A POSTROUTING -s 192.168.200.0/24 -o eth0 -j MASQUERADE
 
 # Loop through all files ending with.ovpn in the specified directory.
-find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file; do
+# find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file; do
+for config_file in "$CONFIG_DIR"/*.ovpn; do
     echo "Selecting configuration in $config_file"
     # Skip iteration if no .ovpn files are present to prevent errors.
     [ -e "$config_file" ] || continue
@@ -77,7 +76,7 @@ find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file
     echo "=================================================="
     echo "Testing configuration: $(basename "$config_file")"
     echo "=================================================="
-
+    # continue
     # This inner loop allows retrying the same config if auth fails.
     while true; do
         # --- Credential Handling ---
@@ -98,7 +97,9 @@ find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file
         # --- Setup ---
         # Ensure no old namespace exists from a failed previous run.
         ip netns del $NAMESPACE &>/dev/null
-
+        ip link add veth-ns type veth peer name veth-wsl
+        ip link set veth-wsl up
+        ip addr add 192.168.200.1/24 dev veth-wsl
         # Create a new, isolated network namespace for the test.
         echo "Creating network namespace: $NAMESPACE"
         ip netns add $NAMESPACE
@@ -152,6 +153,7 @@ find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file
                 # The 'while' loop will now repeat for the same config, prompting for new credentials.
             else
                 echo "FAILURE: Connection timed out for a reason other than authentication."
+                cat $LOG_FILE # Display the log for debugging.
                 break # Exit inner loop and move to next config.
             fi
         fi
@@ -160,11 +162,11 @@ find "$CONFIG_DIR" -type f -name "*.ovpn" -print0 | while read -d '' config_file
         pkill -f "openvpn --config $config_file" &>/dev/null
         ip netns del $NAMESPACE &>/dev/null
     done # End of the inner 'while' loop for retries.
-
     # --- Teardown for this config ---
-    echo "Stopping OpenVPN and cleaning up for this configuration..."
+    echo "Stopping OpenVPN and cleaning up for this configuration ($config_file)..."
     pkill -f "openvpn --config $config_file" &>/dev/null
     ip netns del $NAMESPACE &>/dev/null
+    ip link del veth-wsl
     echo "Done."
     echo
 done
